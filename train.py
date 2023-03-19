@@ -200,4 +200,4 @@ if __name__ == '__main__':
     print("cuDNN Benchmark:", hparams.cudnn_benchmark)
 
     train(args.output_directory, args.log_directory, args.checkpoint_path,
-          args.warm_start, args.n_gpus, args.rank, args.group_name, hparams)
+          args.warm_start, args.n_gpus, args.rank, hparams)
