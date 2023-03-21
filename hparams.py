@@ -7,7 +7,7 @@ class DictDotNotation(dict):
 
 hparams = DictDotNotation({
     "epochs": 20,
-    "iters_per_checkpoint": 20,
+    "iters_per_checkpoint": 100,
     "seed": 1234,
     "dynamic_loss_scaling": True,
     "dist_backend": "nccl",
