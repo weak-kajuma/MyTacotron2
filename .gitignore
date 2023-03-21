@@ -2,3 +2,5 @@ wav/
 __pycache__/
 tacotron2_statedict.pt
 outdir/
+waveglow_256channels.pt
+waveglow_256channels_universal_v5.pt
