@@ -6,17 +6,12 @@ import torch
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler, autocast
-import torch.distributed as dist
-import torch.multiprocessing as mp
-from torch.nn.parallel import DistributedDataParallel as DDP
 
 from model import Tacotron2
 from data_utils import TextMelLoader, TextMelCollate
 from loss_function import Tacotron2Loss
 from logger import Tacotron2Logger
 from hparams import hparams
-from collections import OrderedDict
-from utils import parse_batch
 
 def prepare_directories_and_logger(output_directory, log_directory):
     if not os.path.isdir(output_directory):
@@ -43,16 +38,6 @@ def warm_start_model(checkpoint_path, model, ignore_layers):
     print("Warm starting model from checkpoint '{}'".format(checkpoint_path))
     checkpoint_dict = torch.load(checkpoint_path, map_location='cpu')
     model_dict = checkpoint_dict['state_dict']
-    # The original pre-trained model did not have "module" as a key.
-    new_state_dict = OrderedDict()
-    for k, v in model_dict.items():
-        if 'module' not in k:
-            k = 'module.' + k
-        else:
-            k = k.replace('features.module.', 'module.features.')
-        new_state_dict[k] = v
-    model_dict = new_state_dict
-    
     if len(ignore_layers) > 0:
         model_dict = {k: v for k, v in model_dict.items()
                       if k not in ignore_layers}
@@ -83,18 +68,18 @@ def save_checkpoint(model, optimizer, learning_rate, iteration, filepath):
                 'learning_rate': learning_rate}, filepath)
 
 def validate(model, criterion, valset, iteration, batch_size, n_gpus,
-             collate_fn, logger, rank):
+             collate_fn, logger, distributed_run, rank):
     """Handles all the validation scoring and printing"""
     model.eval()
     with torch.no_grad():
-        val_sampler = DistributedSampler(valset)
+        val_sampler = DistributedSampler(valset) if distributed_run else None
         val_loader = DataLoader(valset, sampler=val_sampler, num_workers=12,
                                 shuffle=False, batch_size=batch_size,
                                 pin_memory=True, collate_fn=collate_fn)
 
         val_loss = 0.0
         for i, batch in enumerate(val_loader):
-            x, y = parse_batch(batch, rank)
+            x, y = model.parse_batch(batch)
             with autocast():
                 y_pred = model(x)
                 loss = criterion(y_pred, y)
@@ -107,15 +92,8 @@ def validate(model, criterion, valset, iteration, batch_size, n_gpus,
         print("Validation loss {}: {:9f}  ".format(iteration, val_loss))
         logger.log_validation(val_loss, model, y, y_pred, iteration)
 
-def setup(rank, n_gpus):
-        os.environ['MASTER_ADDR'] = 'localhost'
-        os.environ['MASTER_PORT'] = '12355'
-        # プロセスグループの初期化
-        dist.init_process_group("nccl", rank=rank, world_size=n_gpus)
-def cleanup():
-    dist.destroy_process_group()
-
-def train(rank,output_directory, log_directory, checkpoint_path, warm_start, n_gpus, hparams):
+def train(output_directory, log_directory, checkpoint_path, warm_start, n_gpus,
+          rank, hparams):
     """Training and validation logging results to tensorboard and stdout
 
     Params
@@ -128,14 +106,10 @@ def train(rank,output_directory, log_directory, checkpoint_path, warm_start, n_g
     hparams (object): comma separated list of "name=value" pairs.
     """
 
-    setup(rank, n_gpus)
-
     torch.manual_seed(hparams.seed)
     torch.cuda.manual_seed(hparams.seed)
 
-    model_noDDP = Tacotron2(hparams).to(rank)
-    model = DDP(model_noDDP, device_ids=[rank])
-
+    model = Tacotron2(hparams).cuda()
     learning_rate = hparams.learning_rate
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate,
                                  weight_decay=hparams.weight_decay)
@@ -173,8 +147,7 @@ def train(rank,output_directory, log_directory, checkpoint_path, warm_start, n_g
                 param_group['lr'] = learning_rate
 
             model.zero_grad()
-            # DDP model has no parse_batch method
-            x, y = parse_batch(batch, rank)
+            x, y = model.parse_batch(batch)
             with autocast():   
                 y_pred = model(x)
                 loss = criterion(y_pred, y)
@@ -192,7 +165,8 @@ def train(rank,output_directory, log_directory, checkpoint_path, warm_start, n_g
 
             if (iteration % hparams.iters_per_checkpoint == 0):
                 validate(model, criterion, valset, iteration,
-                         hparams.batch_size, n_gpus, collate_fn, logger,rank)
+                         hparams.batch_size, n_gpus, collate_fn, logger,
+                         hparams.distributed_run, rank)
                 if rank == 0:
                     checkpoint_path = os.path.join(
                         output_directory, "checkpoint_{}".format(iteration))
@@ -200,7 +174,6 @@ def train(rank,output_directory, log_directory, checkpoint_path, warm_start, n_g
                                     checkpoint_path)
 
             iteration += 1
-    cleanup()
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -214,6 +187,8 @@ if __name__ == '__main__':
                         help='load model weights only, ignore specified layers')
     parser.add_argument('--n_gpus', type=int, default=1,
                         required=False, help='number of gpus')
+    parser.add_argument('--rank', type=int, default=0,
+                        required=False, help='rank of current gpu')
 
     args = parser.parse_args()
 
@@ -224,9 +199,5 @@ if __name__ == '__main__':
     print("cuDNN Enabled:", hparams.cudnn_enabled)
     print("cuDNN Benchmark:", hparams.cudnn_benchmark)
 
-    mp.spawn(
-        train,
-        args=(args.output_directory, args.log_directory, args.checkpoint_path,args.warm_start,args.n_gpus, hparams),
-        nprocs=args.n_gpus,
-        join=True
-    )
+    train(args.output_directory, args.log_directory, args.checkpoint_path,
+          args.warm_start, args.n_gpus, args.rank, hparams)
