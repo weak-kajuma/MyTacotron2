@@ -94,7 +94,7 @@ def validate(model, criterion, valset, iteration, batch_size, n_gpus,
 
         val_loss = 0.0
         for i, batch in enumerate(val_loader):
-            x, y = parse_batch(batch)
+            x, y = parse_batch(batch, rank)
             with autocast():
                 y_pred = model(x)
                 loss = criterion(y_pred, y)
@@ -133,7 +133,7 @@ def train(rank,output_directory, log_directory, checkpoint_path, warm_start, n_g
     torch.manual_seed(hparams.seed)
     torch.cuda.manual_seed(hparams.seed)
 
-    model_noDDP = Tacotron2(hparams).cuda()
+    model_noDDP = Tacotron2(hparams).to(rank)
     model = DDP(model_noDDP, device_ids=[rank])
 
     learning_rate = hparams.learning_rate
@@ -174,7 +174,7 @@ def train(rank,output_directory, log_directory, checkpoint_path, warm_start, n_g
 
             model.zero_grad()
             # DDP model has no parse_batch method
-            x, y = parse_batch(batch)
+            x, y = parse_batch(batch, rank)
             with autocast():   
                 y_pred = model(x)
                 loss = criterion(y_pred, y)
